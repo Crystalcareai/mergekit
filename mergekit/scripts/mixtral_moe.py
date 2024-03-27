@@ -26,10 +26,10 @@ import yaml
 from pydantic import BaseModel
 from transformers import (
    AutoModelForCausalLM,
-   DeepseekConfig,
-   DeepseekForCausalLM,
    LlamaForCausalLM,
 )
+from mergekit.configuration_deepseek import DeepseekConfig
+from mergekit.modeling_deepseek import DeepseekForCausalLM
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 import mergekit.architecture
@@ -270,10 +270,10 @@ def build(
    if is_bad_config(config, allow_all_same=allow_all_same):
        sys.exit(1)
 
-   if config.experts_per_token < 1:
+   if config.num_experts_per_tok < 1:
        logging.error("Experts per token must be >= 1")
        sys.exit(1)
-   if config.experts_per_token > len(config.experts):
+   if config.num_experts_per_tok > len(config.experts):
        logging.error("Experts per token must be <= number of experts")
        sys.exit(1)
 
@@ -288,7 +288,7 @@ def build(
    out_cfg = DeepseekConfig(**base_cfg.to_dict())
    out_cfg.architectures = ["DeepseekForCausalLM"]
    out_cfg.n_routed_experts = len(config.experts)
-   out_cfg.num_experts_per_tok = config.experts_per_token
+   out_cfg.num_experts_per_tok = config.num_experts_per_tok
    out_cfg.n_shared_experts = config.n_shared_experts
    out_cfg.moe_intermediate_size = config.moe_intermediate_size
    out_cfg.moe_layer_freq = config.moe_layer_freq
@@ -414,78 +414,78 @@ def build(
 
    logging.info("Done.")
 
-   @click.command("mergekit-moe")
-   @click.argument("config_path", type=click.Path(exists=True, dir_okay=False))
-   @click.argument("out_path", type=click.Path())
-   @click.option(
-       "--load-in-4bit",
-       is_flag=True,
-       type=bool,
-       default=False,
-       help="Load model in 4bit for computing hidden states",
-   )
-   @click.option(
-       "--load-in-8bit",
-       is_flag=True,
-       type=bool,
-       default=False,
-       help="Load model in 8bit for computing hidden states",
-   )
-   @click.option(
-       "--device",
-       type=str,
-       default="auto",
-       help="Device to use to compute embeddings",
-       show_default=True,
-   )
-   @click.option(
-       "--verbose", "-v", type=bool, default=False, is_flag=True, help="Verbose logging"
-   )
-   @click.option(
-       "--i-understand-this-is-not-useful-without-training",
-       type=bool,
-       default=False,
-       is_flag=True,
-       help="Really make the questionable model you want.",
-   )
-   @add_merge_options
-   def main(
-       config_path: str,
-       out_path: str,
-       load_in_4bit: bool,
-       load_in_8bit: bool,
-       device: str,
-       merge_options: MergeOptions,
-       verbose: bool,
-       i_understand_this_is_not_useful_without_training: bool,
-   ):
-       logging.basicConfig(level=logging.INFO if verbose else logging.WARNING)
+@click.command("mergekit-moe")
+@click.argument("config_path", type=click.Path(exists=True, dir_okay=False))
+@click.argument("out_path", type=click.Path())
+@click.option(
+    "--load-in-4bit",
+    is_flag=True,
+    type=bool,
+    default=False,
+    help="Load model in 4bit for computing hidden states",
+)
+@click.option(
+    "--load-in-8bit",
+    is_flag=True,
+    type=bool,
+    default=False,
+    help="Load model in 8bit for computing hidden states",
+)
+@click.option(
+    "--device",
+    type=str,
+    default="auto",
+    help="Device to use to compute embeddings",
+    show_default=True,
+)
+@click.option(
+    "--verbose", "-v", type=bool, default=False, is_flag=True, help="Verbose logging"
+)
+@click.option(
+    "--i-understand-this-is-not-useful-without-training",
+    type=bool,
+    default=False,
+    is_flag=True,
+    help="Really make the questionable model you want.",
+)
+@add_merge_options
+def main(
+    config_path: str,
+    out_path: str,
+    load_in_4bit: bool,
+    load_in_8bit: bool,
+    device: str,
+    merge_options: MergeOptions,
+    verbose: bool,
+    i_understand_this_is_not_useful_without_training: bool,
+):
+    logging.basicConfig(level=logging.INFO if verbose else logging.WARNING)
 
-       if merge_options.cuda:
-           logging.warning(
-               '--cuda is a no-op for mergekit-moe, use "--device cuda" instead'
-           )
+    if merge_options.cuda:
+        logging.warning(
+            '--cuda is a no-op for mergekit-moe, use "--device cuda" instead'
+        )
 
-       with open(config_path, "r", encoding="utf-8") as file:
-           config_source = file.read()
+    with open(config_path, "r", encoding="utf-8") as file:
+        config_source = file.read()
 
-       config = DeepseekMOEConfig.model_validate(yaml.safe_load(config_source))
-       build(
-           config,
-           out_path=out_path,
-           merge_options=merge_options,
-           load_in_4bit=load_in_4bit,
-           load_in_8bit=load_in_8bit,
-           device=device,
-           allow_all_same=i_understand_this_is_not_useful_without_training,
-       )
+    config = DeepseekMOEConfig.model_validate(yaml.safe_load(config_source))
+    build(
+        config,
+        out_path=out_path,
+        merge_options=merge_options,
+        load_in_4bit=load_in_4bit,
+        load_in_8bit=load_in_8bit,
+        device=device,
+        allow_all_same=i_understand_this_is_not_useful_without_training,
+    )
 
-       if merge_options.write_model_card:
-           # TODO: generate a README.md as well
-           with open(
-               os.path.join(out_path, "mergekit_moe_config.yml"), "w", encoding="utf-8"
-           ) as fp:
-               fp.write(config_source)
+    if merge_options.write_model_card:
+        # TODO: generate a README.md as well
+        with open(
+            os.path.join(out_path, "mergekit_moe_config.yml"), "w", encoding="utf-8"
+        ) as fp:
+            fp.write(config_source)
 
-   if __name__ == "__main__":
-       main()
+if __name__ == "__main__":
+    main()
