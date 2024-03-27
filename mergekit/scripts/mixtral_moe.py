@@ -266,6 +266,7 @@ def build(
     load_in_8bit: bool = False,
     device: str = "auto",
     allow_all_same: bool = False,
+    clone_tensors: bool = False,
 ):
    if is_bad_config(config, allow_all_same=allow_all_same):
        sys.exit(1)
@@ -345,53 +346,54 @@ def build(
        writer.save_tensor(
            tensor_name, tensor.to(dtype=out_dtype), clone=merge_options.clone_tensors
        )
+       for layer_idx in range(base_cfg.num_hidden_layers):
+            for weight_info in Deepseek_INFO.layer_weights(index=layer_idx, config=base_cfg):
+                tensor_name = weight_info.name
 
-   for layer_idx in range(base_cfg.num_hidden_layers):
-       for weight_info in Deepseek_INFO.layer_weights(index=layer_idx, config=base_cfg):
-           tensor_name = weight_info.name
+            if ".mlp." in tensor_name:
+                for moe_index, expert in enumerate(config.experts):
+                    expert_name = tensor_name.replace(
+                        ".mlp.gate_proj", f".mlp.experts.{moe_index}.gate_proj"
+                    )
+                    expert_name = expert_name.replace(
+                        ".mlp.down_proj", f".mlp.experts.{moe_index}.down_proj"
+                    )
+                    expert_name = expert_name.replace(
+                        ".mlp.up_proj", f".mlp.experts.{moe_index}.up_proj"
+                    )
+                    expert_loader = loaders.get(expert.model_ref)
+                    tensor = expert_loader.get_tensor(tensor_name)
+                    if expert.noise_scale:
+                        tensor += torch.randn_like(tensor) * expert.noise_scale
+                    writer.save_tensor(
+                        expert_name, tensor.to(dtype=out_dtype), clone=True
+                    )
 
-           if ".mlp." in tensor_name:
-               is_shared_expert = False
-               if config.n_shared_experts > 0:
-                   for weight_name in [".gate_proj", ".up_proj", ".down_proj"]:
-                       if tensor_name.endswith(f"mlp.shared_experts{weight_name}.weight"):
-                           is_shared_expert = True
-                           break
-
-               if is_shared_expert:
-                   writer.save_tensor(
-                       tensor_name, base_loader.get_tensor(tensor_name).to(dtype=out_dtype)
-                   )
-               else:
-                   for moe_index, expert in enumerate(config.experts):
-                       expert_name = tensor_name.replace(
-                           ".mlp.gate_proj", f".mlp.experts.{moe_index}.gate_proj"
-                       )
-                       expert_name = expert_name.replace(
-                           ".mlp.down_proj", f".mlp.experts.{moe_index}.down_proj"
-                       )
-                       expert_name = expert_name.replace(
-                           ".mlp.up_proj", f".mlp.experts.{moe_index}.up_proj"
-                       )
-                       expert_loader = loaders.get(expert.model_ref)
-                       tensor = expert_loader.get_tensor(tensor_name)
-                       if expert.noise_scale:
-                           tensor += torch.randn_like(tensor) * expert.noise_scale
-                       writer.save_tensor(
-                           expert_name, tensor.to(dtype=out_dtype), clone=True
-                       )
-           else:
-               writer.save_tensor(
-                   tensor_name, base_loader.get_tensor(tensor_name).to(dtype=out_dtype)
-               )
-               tokenizer = transformers.AutoTokenizer.from_pretrained(
+                if config.n_shared_experts > 0:
+                    for shared_expert_idx in range(config.n_shared_experts):
+                        for weight_name in [".gate_proj", ".up_proj", ".down_proj"]:
+                            shared_expert_name = tensor_name.replace(
+                                ".mlp.",
+                                f".mlp.shared_experts.{shared_expert_idx}."
+                            ).replace(
+                                weight_name,
+                                f"{weight_name}.weight"
+                            )
+                            writer.save_tensor(
+                                shared_expert_name, base_loader.get_tensor(tensor_name).to(dtype=out_dtype), clone=clone_tensors
+                            )
+                else:
+                    writer.save_tensor(
+                        tensor_name, base_loader.get_tensor(tensor_name).to(dtype=out_dtype), clone=clone_tensors
+                    )
+                tokenizer = transformers.AutoTokenizer.from_pretrained(
                     base_model.model.path, revision=base_model.model.revision
-    )
-   tokenizer.padding_side = "left"
-   tokenizer.pad_token_id = tokenizer.bos_token_id
+                )
+                tokenizer.padding_side = "left"
+                tokenizer.pad_token_id = tokenizer.bos_token_id
 
-   logging.info("Getting gate parameters...")
-   gate_vecs = get_gate_params(
+                logging.info("Getting gate parameters...")
+                gate_vecs = get_gate_params(
        base_model,
        tokenizer,
        config.experts,
@@ -452,6 +454,13 @@ def build(
     is_flag=True,
     help="Really make the questionable model you want.",
 )
+@click.option(
+    "--clone-tensors",
+    is_flag=True,
+    type=bool,
+    default=False,
+    help="Clone tensors before saving, to allow multiple occurrences of the same layer",
+)
 @add_merge_options
 def main(
     config_path: str,
@@ -462,6 +471,7 @@ def main(
     merge_options: MergeOptions,
     verbose: bool,
     i_understand_this_is_not_useful_without_training: bool,
+    clone_tensors: bool = False,
 ):
     logging.basicConfig(level=logging.INFO if verbose else logging.WARNING)
 
@@ -482,6 +492,7 @@ def main(
         load_in_8bit=load_in_8bit,
         device=device,
         allow_all_same=i_understand_this_is_not_useful_without_training,
+        clone_tensors=clone_tensors,
     )
 
     if merge_options.write_model_card:
