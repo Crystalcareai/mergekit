@@ -259,13 +259,13 @@ def is_bad_config(config: DeepseekMOEConfig, allow_all_same: bool = False) -> bo
 
 
 def build(
-   config: DeepseekMOEConfig,
-   out_path: str,
-   merge_options: MergeOptions,
-   load_in_4bit: bool = False,
-   load_in_8bit: bool = False,
-   device: str = "auto",
-   allow_all_same: bool = False,
+    config: DeepseekMOEConfig,
+    out_path: str,
+    merge_options: MergeOptions,
+    load_in_4bit: bool = False,
+    load_in_8bit: bool = False,
+    device: str = "auto",
+    allow_all_same: bool = False,
 ):
    if is_bad_config(config, allow_all_same=allow_all_same):
        sys.exit(1)
@@ -334,12 +334,9 @@ def build(
            out_dtype = dtype_from_name(out_dtype)
    else:
        out_dtype = None
-
    logging.info("Copying parameters...")
    Deepseek_INFO = mergekit.architecture.Deepseek_INFO
-   for weight_info in Deepseek_INFO.pre_weights(base_cfg) + Deepseek_INFO.post_weights(
-       base_cfg
-   ):
+   for weight_info in Deepseek_INFO.pre_weights(base_cfg) + Deepseek_INFO.post_weights(base_cfg):
        tensor_name = weight_info.name
        tensor = base_loader.get_tensor(tensor_name)
        if not out_dtype:
@@ -354,34 +351,39 @@ def build(
            tensor_name = weight_info.name
 
            if ".mlp." in tensor_name:
-               for moe_index, expert in enumerate(config.experts):
-                   expert_name = tensor_name.replace(
-                       ".mlp.gate_proj", f".mlp.experts.{moe_index}.gate_proj"
-                   )
-                   expert_name = expert_name.replace(
-                       ".mlp.down_proj", f".mlp.experts.{moe_index}.down_proj"
-                   )
-                   expert_name = expert_name.replace(
-                       ".mlp.up_proj", f".mlp.experts.{moe_index}.up_proj"
-                   )
-                   expert_loader = loaders.get(expert.model_ref)
-                   tensor = expert_loader.get_tensor(tensor_name)
-                   if expert.noise_scale:
-                       tensor += torch.randn_like(tensor) * expert.noise_scale
-                   writer.save_tensor(
-                       expert_name, tensor.to(dtype=out_dtype), clone=True
-                   )
-               
+               is_shared_expert = False
                if config.n_shared_experts > 0:
                    for weight_name in [".gate_proj", ".up_proj", ".down_proj"]:
-                       tensor_name = f"model.layers.{layer_idx}.mlp.shared_experts{weight_name}.weight"
-                       writer.save_tensor(
-           tensor_name, base_loader.get_tensor(tensor_name).to(dtype=out_dtype)
-       )
+                       if tensor_name.endswith(f"mlp.shared_experts{weight_name}.weight"):
+                           is_shared_expert = True
+                           break
 
-   tokenizer = transformers.AutoTokenizer.from_pretrained(
-       base_model.model.path, revision=base_model.model.revision
-   )
+               if is_shared_expert:
+                   writer.save_tensor(
+                       tensor_name, base_loader.get_tensor(tensor_name).to(dtype=out_dtype)
+                   )
+               else:
+                   for moe_index, expert in enumerate(config.experts):
+                       expert_name = tensor_name.replace(
+                           ".mlp.gate_proj", f".mlp.experts.{moe_index}.gate_proj"
+                       )
+                       expert_name = expert_name.replace(
+                           ".mlp.down_proj", f".mlp.experts.{moe_index}.down_proj"
+                       )
+                       expert_name = expert_name.replace(
+                           ".mlp.up_proj", f".mlp.experts.{moe_index}.up_proj"
+                       )
+                       expert_loader = loaders.get(expert.model_ref)
+                       tensor = expert_loader.get_tensor(tensor_name)
+                       if expert.noise_scale:
+                           tensor += torch.randn_like(tensor) * expert.noise_scale
+                       writer.save_tensor(
+                           expert_name, tensor.to(dtype=out_dtype), clone=True
+                       )
+           else:
+               writer.save_tensor(
+                   tensor_name, base_loader.get_tensor(tensor_name).to(dtype=out_dtype)
+               )
    tokenizer.padding_side = "left"
    tokenizer.pad_token_id = tokenizer.bos_token_id
 
@@ -398,7 +400,6 @@ def build(
        device=device,
    )
    # gate_vecs: (num_layers, num_experts, hidden_size)
-
    warn_degenerate_gates(gate_vecs)
 
    for layer_idx in range(base_cfg.num_hidden_layers):
