@@ -243,38 +243,42 @@ class JsonArchitectureInfo(ArchitectureInfo, BaseModel, frozen=True):
         return self.definition.num_layers_config_key
 
 
-class MixtralTensorNames(ArchitectureInfo, BaseModel):
-    ARCHITECTURE_NAME: ClassVar[str] = "MixtralForCausalLM"
-    num_local_experts: int
+class DeepseekMoETensorNames(ArchitectureInfo, BaseModel):
+    ARCHITECTURE_NAME: ClassVar[str] = 'DeepseekForCausalLM'
+    n_routed_experts: int
 
     @classmethod
     def from_config(cls, config: PretrainedConfig):
-        return MixtralTensorNames(num_local_experts=config.num_local_experts)
+        return DeepseekMoETensorNames(n_routed_experts=config.n_routed_experts)
 
     def pre_weights(self, config: PretrainedConfig) -> List[WeightInfo]:
-        return MISTRAL_INFO.pre_weights(config)
+        return Deepseek_INFO.pre_weights(config)
 
     def post_weights(self, config: PretrainedConfig) -> List[WeightInfo]:
-        return MISTRAL_INFO.post_weights(config)
+        return Deepseek_INFO.post_weights(config)
 
     def num_layers_config_key(self) -> str:
-        return MISTRAL_INFO.num_layers_config_key()
+        return Deepseek_INFO.num_layers_config_key()
 
-    def layer_weights(
-        self, index: int, config: PretrainedConfig
-    ) -> Optional[List[WeightInfo]]:
-        num_experts = self.num_local_experts
-        prefix = f"model.layers.{index}"
+    def layer_weights(self, index: int, config: PretrainedConfig) -> Optional[List[WeightInfo]]:
+        num_experts = self.n_routed_experts
+        shared_experts = config.n_shared_experts or 0
+        prefix = f'model.layers.{index}'
         tensor_names = []
+
+        tensor_names.append(f'{prefix}.mlp.gate.weight')  # Gating network weights
+
         for expert_idx in range(num_experts):
-            for param in ("w1", "w2", "w3"):
-                tensor_names.append(
-                    prefix + f".block_sparse_moe.experts.{expert_idx}.{param}.weight"
-                )
-        tensor_names.append(prefix + ".block_sparse_moe.gate.weight")
-        res = []
-        for name in tensor_names:
-            res.append(WeightInfo(name=name))
+            tensor_names.append(f'{prefix}.mlp.experts.{expert_idx}.gate_proj.weight')
+            tensor_names.append(f'{prefix}.mlp.experts.{expert_idx}.up_proj.weight')
+            tensor_names.append(f'{prefix}.mlp.experts.{expert_idx}.down_proj.weight')
+
+        if shared_experts > 0:
+            tensor_names.append(f'{prefix}.mlp.shared_experts.gate_proj.weight')
+            tensor_names.append(f'{prefix}.mlp.shared_experts.up_proj.weight')
+            tensor_names.append(f'{prefix}.mlp.shared_experts.down_proj.weight')
+
+        res = [WeightInfo(name=name) for name in tensor_names]
         return res
 
     def sliceable(self) -> bool:
@@ -308,29 +312,21 @@ def _load_all_architectures() -> (
 
 
 JSON_ARCHITECTURES, NAME_TO_ARCH = _load_all_architectures()
-MISTRAL_INFO = _load_json_arch("mistral.json")
+Deepseek_INFO = _load_json_arch("mistral.json")
 
 
 def get_architecture_info(config: PretrainedConfig) -> ArchitectureInfo:
     if len(config.architectures) != 1:
-        raise RuntimeError("More than one architecture in config?")
-
+        raise RuntimeError('More than one architecture in config?')
     arch_name = config.architectures[0]
-
-    if arch_name == MixtralTensorNames.ARCHITECTURE_NAME:
-        return MixtralTensorNames.from_config(config)
-
+    if arch_name == DeepseekMoETensorNames.ARCHITECTURE_NAME:
+        return DeepseekMoETensorNames.from_config(config)
     if arch_name not in NAME_TO_ARCH:
-        raise RuntimeError(f"Unsupported architecture {arch_name}")
-
+        raise RuntimeError(f'Unsupported architecture {arch_name}')
     candidates = list(NAME_TO_ARCH[arch_name])
     if len(candidates) == 1:
         return candidates[0]
-
     for c in candidates:
         if c.definition.expected_model_type == config.model_type:
             return c
-
-    raise RuntimeError(
-        f"Unsupported model_type {config.model_type} for architecture {arch_name}"
-    )
+    raise RuntimeError(f'Unsupported model_type {config.model_type} for architecture {arch_name}')
