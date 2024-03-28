@@ -295,16 +295,11 @@ def build(
             "not a power of two. The model will not be usable in llama.cpp."
         )
 
-    loaders: Dict[ModelReference, LazyTensorLoader] = {}
-    for model in tqdm.tqdm(
-        [base_model] + [e.model_ref for e in config.experts], desc="Warm up loaders"
-    ):
-        loaders[model] = LazyTensorLoader(
-            model.tensor_index(cache_dir=merge_options.transformers_cache),
-            lazy_unpickle=merge_options.lazy_unpickle,
-        )
+    base_loader = LazyTensorLoader(
+        base_model.tensor_index(cache_dir=merge_options.transformers_cache),
+        lazy_unpickle=merge_options.lazy_unpickle,
+    )
 
-    base_loader = loaders.get(base_model)
     writer = TensorWriter(
         out_path=out_path,
         max_shard_size=merge_options.out_shard_size,
@@ -321,22 +316,22 @@ def build(
         out_dtype = None
 
     logging.info("Copying parameters...")
-    MISTRAL_INFO = mergekit.architecture.MISTRAL_INFO
-    for weight_info in MISTRAL_INFO.pre_weights(base_cfg) + MISTRAL_INFO.post_weights(
-        base_cfg
-    ):
+    base_arch_info = mergekit.architecture.get_architecture_info(base_cfg)
+    for weight_info in base_arch_info.pre_weights(base_cfg) + base_arch_info.post_weights(base_cfg):
         tensor_name = weight_info.name
         tensor = base_loader.get_tensor(tensor_name)
         if not out_dtype:
-            # All else has failed, take the first dtype we see
             out_dtype = tensor.dtype
         writer.save_tensor(
             tensor_name, tensor.to(dtype=out_dtype), clone=merge_options.clone_tensors
         )
 
     for layer_idx in range(base_cfg.num_hidden_layers):
-        for weight_info in MISTRAL_INFO.layer_weights(index=layer_idx, config=base_cfg):
+        for weight_info in base_arch_info.layer_weights(index=layer_idx, config=base_cfg):
             tensor_name = weight_info.name
+
+            if "block_sparse_moe" in tensor_name:
+                continue
 
             if ".mlp." in tensor_name:
                 for moe_index, expert in enumerate(config.experts):
@@ -349,17 +344,16 @@ def build(
                     expert_name = expert_name.replace(
                         ".mlp.up_proj", f".block_sparse_moe.experts.{moe_index}.w3"
                     )
-                    expert_loader = loaders.get(expert.model_ref)
-                    tensor = expert_loader.get_tensor(tensor_name)
+                    tensor = base_loader.get_tensor(tensor_name)
                     if expert.noise_scale:
                         tensor += torch.randn_like(tensor) * expert.noise_scale
                     writer.save_tensor(
                         expert_name, tensor.to(dtype=out_dtype), clone=True
                     )
-                continue
-            writer.save_tensor(
-                tensor_name, base_loader.get_tensor(tensor_name).to(dtype=out_dtype)
-            )
+            else:
+                writer.save_tensor(
+                    tensor_name, base_loader.get_tensor(tensor_name).to(dtype=out_dtype)
+                )
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         base_model.model.path, revision=base_model.model.revision
@@ -395,6 +389,7 @@ def build(
         tokenizer.save_pretrained(out_path, safe_serialization=True)
 
     logging.info("Done.")
+
 
 
 @click.command("mergekit-moe")
