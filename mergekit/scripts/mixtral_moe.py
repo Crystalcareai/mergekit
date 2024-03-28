@@ -351,38 +351,31 @@ def build(
                 tensor_name = weight_info.name
 
             if ".mlp." in tensor_name:
-                for moe_index, expert in enumerate(config.experts):
-                    expert_name = tensor_name.replace(
-                        ".mlp.gate_proj", f".mlp.experts.{moe_index}.gate_proj"
-                    )
-                    expert_name = expert_name.replace(
-                        ".mlp.down_proj", f".mlp.experts.{moe_index}.down_proj"
-                    )
-                    expert_name = expert_name.replace(
-                        ".mlp.up_proj", f".mlp.experts.{moe_index}.up_proj"
-                    )
-                    expert_loader = loaders.get(expert.model_ref)
-                    tensor = expert_loader.get_tensor(tensor_name)
-                    if expert.noise_scale:
-                        tensor += torch.randn_like(tensor) * expert.noise_scale
-                    writer.save_tensor(
-                        expert_name, tensor.to(dtype=out_dtype), clone=True
-                    )
+                if tensor_name.endswith((".gate_proj.weight", ".up_proj.weight", ".down_proj.weight")):
+                    # Save expert weights
+                    for moe_index, expert in enumerate(config.experts):
+                        expert_name = tensor_name.replace(
+                            ".mlp.", f".mlp.experts.{moe_index}."
+                        )
+                        expert_loader = loaders.get(expert.model_ref)
+                        tensor = expert_loader.get_tensor(tensor_name)
+                        if expert.noise_scale:
+                            tensor += torch.randn_like(tensor) * expert.noise_scale
+                        writer.save_tensor(
+                            expert_name, tensor.to(dtype=out_dtype), clone=True
+                        )
 
-                if config.n_shared_experts > 0:
-                    for shared_expert_idx in range(config.n_shared_experts):
-                        for weight_name in [".gate_proj", ".up_proj", ".down_proj"]:
+                    # Save shared expert weights
+                    if config.n_shared_experts > 0:
+                        for shared_expert_idx in range(config.n_shared_experts):
                             shared_expert_name = tensor_name.replace(
-                                ".mlp.",
-                                f".mlp.shared_experts.{shared_expert_idx}."
-                            ).replace(
-                                weight_name,
-                                f"{weight_name}.weight"
+                                ".mlp.", f".mlp.shared_experts.{shared_expert_idx}."
                             )
                             writer.save_tensor(
                                 shared_expert_name, base_loader.get_tensor(tensor_name).to(dtype=out_dtype), clone=clone_tensors
                             )
                 else:
+                    # Save base model weights
                     writer.save_tensor(
                         tensor_name, base_loader.get_tensor(tensor_name).to(dtype=out_dtype), clone=clone_tensors
                     )
