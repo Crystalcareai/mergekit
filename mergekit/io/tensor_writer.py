@@ -23,22 +23,8 @@ import torch
 
 
 class TensorWriter:
-    out_path: str
-    max_shard_size: int
-    shards_written: int
-    weight_map = Dict[str, str]
-    current_shard: Dict[str, torch.Tensor]
-    current_shard_size: int
-    safe_serialization: bool
-
-    def __init__(
-        self,
-        out_path: str,
-        max_shard_size: int = 1000 * 1000 * 1000 * 5,
-        safe_serialization: bool = True,
-    ) -> None:
+    def __init__(self, out_path: str, max_shard_size: int = 1000 * 1000 * 1000 * 5, safe_serialization: bool = True) -> None:
         os.makedirs(out_path, exist_ok=True)
-
         self.out_path = out_path
         self.max_shard_size = max_shard_size
         self.safe_serialization = safe_serialization
@@ -46,20 +32,33 @@ class TensorWriter:
         self.weight_map = {}
         self.current_shard = {}
         self.current_shard_size = 0
+        self.total_size = 0
+        self.sharded_tensors = {}
 
     def save_tensor(self, name: str, tensor: torch.Tensor, clone: bool = False):
-        tensor_size = tensor.view(-1).shape[0]
-        if (
-            self.current_shard
-            and self.current_shard_size + tensor_size > self.max_shard_size
-        ):
+        tensor_size = tensor.numel() * tensor.element_size()
+        if self.current_shard and self.current_shard_size + tensor_size > self.max_shard_size:
             self.flush_current_shard()
 
         if clone:
             tensor = tensor.clone()
 
-        self.current_shard[name] = tensor
-        self.current_shard_size += tensor_size
+        if tensor_size > self.max_shard_size:
+            # Handle large tensors that exceed the maximum shard size
+            num_shards = (tensor_size + self.max_shard_size - 1) // self.max_shard_size
+            tensor_shards = tensor.chunk(num_shards)
+            for i, tensor_shard in enumerate(tensor_shards):
+                shard_name = f"{name}.shard_{i}"
+                self.current_shard[shard_name] = tensor_shard
+                self.current_shard_size += tensor_shard.numel() * tensor_shard.element_size()
+                if shard_name not in self.sharded_tensors:
+                    self.sharded_tensors[shard_name] = []
+                self.sharded_tensors[shard_name].append(f"model-{self.shards_written+1:05d}-of-00007.safetensors")
+        else:
+            self.current_shard[name] = tensor
+            self.current_shard_size += tensor_size
+
+        self.total_size += tensor_size
 
     def flush_current_shard(self):
         if not self.current_shard:
@@ -68,9 +67,10 @@ class TensorWriter:
         logging.info(f"Writing shard #{self.shards_written+1} to disk")
 
         prefix, extension = self._get_name_components()
-        shard_name = f"{prefix}-{self.shards_written+1}.{extension}"
+        shard_name = f"{prefix}-{self.shards_written+1:05d}-of-00007.{extension}"
         for key in self.current_shard:
-            self.weight_map[key] = shard_name
+            if key not in self.sharded_tensors:
+                self.weight_map[key] = shard_name
 
         shard_path = os.path.join(self.out_path, shard_name)
         if self.safe_serialization:
@@ -80,7 +80,7 @@ class TensorWriter:
 
         self.current_shard = {}
         self.current_shard_size = 0
-        self.shards_written = self.shards_written + 1
+        self.shards_written += 1
 
     def finalize(self):
         self.flush_current_shard()
@@ -89,28 +89,10 @@ class TensorWriter:
 
         prefix, extension = self._get_name_components()
 
-        # standardize shard names to hf format
-        total_shards = self.shards_written
-        name_remap = {}
-        for idx in range(total_shards):
-            name_remap[
-                f"{prefix}-{idx+1}.{extension}"
-            ] = f"{prefix}-{idx+1:05d}-of-{total_shards:05d}.{extension}"
+        for key, shard_names in self.sharded_tensors.items():
+            self.weight_map[key] = shard_names
 
-        for old_name, new_name in name_remap.items():
-            os.rename(
-                os.path.join(self.out_path, old_name),
-                os.path.join(self.out_path, new_name),
-            )
-
-        for key in self.weight_map:
-            self.weight_map[key] = name_remap[self.weight_map[key]]
-
-        with open(
-            os.path.join(self.out_path, f"{prefix}.{extension}.index.json"),
-            "w",
-            encoding="utf-8",
-        ) as file:
+        with open(os.path.join(self.out_path, f"{prefix}.{extension}.index.json"), "w", encoding="utf-8") as file:
             json.dump(
                 {
                     "metadata": {"mergekit_version": "0.0.4.1"},
