@@ -286,17 +286,12 @@ class MixtralTensorNames(ArchitectureInfo, BaseModel):
 
 def _load_json_arch(name: str) -> JsonArchitectureInfo:
     text = importlib.resources.read_text(mergekit._data.architectures, name)
-    return JsonArchitectureInfo(
-        definition=JSONArchitectureDefinition.model_validate_json(text)
-    )
+    return JsonArchitectureInfo(definition=JSONArchitectureDefinition.model_validate_json(text))
 
-
-def _load_all_architectures() -> (
-    Tuple[List[JsonArchitectureInfo], Dict[str, List[JsonArchitectureInfo]]]
-):
+def _load_all_architectures() -> Tuple[List[JsonArchitectureInfo], Dict[str, List[JsonArchitectureInfo]]]:
     architectures: List[JsonArchitectureInfo] = []
     for f in importlib.resources.contents(mergekit._data.architectures):
-        if f.lower().endswith(".json"):
+        if f.lower().endswith('.json'):
             architectures.append(_load_json_arch(f))
 
     name_to_arch: Dict[str, List[JsonArchitectureInfo]] = {}
@@ -306,14 +301,11 @@ def _load_all_architectures() -> (
             name_to_arch[name].append(arch_info)
     return architectures, name_to_arch
 
-
 JSON_ARCHITECTURES, NAME_TO_ARCH = _load_all_architectures()
-MISTRAL_INFO = _load_json_arch("mistral.json")
-
 
 def get_architecture_info(config: PretrainedConfig) -> ArchitectureInfo:
     if len(config.architectures) != 1:
-        raise RuntimeError("More than one architecture in config?")
+        raise RuntimeError('More than one architecture in config?')
 
     arch_name = config.architectures[0]
 
@@ -321,7 +313,7 @@ def get_architecture_info(config: PretrainedConfig) -> ArchitectureInfo:
         return MixtralTensorNames.from_config(config)
 
     if arch_name not in NAME_TO_ARCH:
-        raise RuntimeError(f"Unsupported architecture {arch_name}")
+        raise RuntimeError(f'Unsupported architecture {arch_name}')
 
     candidates = list(NAME_TO_ARCH[arch_name])
     if len(candidates) == 1:
@@ -331,6 +323,7 @@ def get_architecture_info(config: PretrainedConfig) -> ArchitectureInfo:
         if c.definition.expected_model_type == config.model_type:
             return c
 
-    raise RuntimeError(
-        f"Unsupported model_type {config.model_type} for architecture {arch_name}"
-    )
+    raise RuntimeError(f'Unsupported model_type {config.model_type} for architecture {arch_name}')
+
+
+
