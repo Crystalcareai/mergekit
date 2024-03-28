@@ -190,37 +190,39 @@ def get_gate_params(
 
 
 def warn_degenerate_gates(gate_vecs: torch.Tensor, threshold: float = 5.0):
-   degen_indices = []
-   num_layers, _num_experts, _hidden_size = gate_vecs.shape
-   for idx in range(num_layers):
-       c = torch.linalg.cond(gate_vecs[idx, :, :].float())
-       if c > threshold:
-           degen_indices.append(idx)
+    degen_indices = []
+    num_layers, num_experts, hidden_size = gate_vecs.shape
+    for layer_idx in range(num_layers):
+        c = torch.linalg.cond(gate_vecs[layer_idx, :, :].float())
+        if c > threshold:
+            degen_indices.append(layer_idx)
 
-   if degen_indices:
-       if len(degen_indices) == 1:
-           layer_str = f"layer {degen_indices[0]}"
-           verb = "has"
-       elif len(degen_indices) == 2:
-           layer_str = f"layers {' and '.join(map(str, degen_indices))}"
-           verb = "have"
-       elif len(degen_indices) >= num_layers:
-           layer_str = "ALL layers"
-           verb = "have"
-       else:
-           layer_str = (
-               "layers "
-               + ", ".join(map(str, degen_indices[:-1]))
-               + ", and "
-               + str(degen_indices[-1])
-           )
-           verb = "have"
+    if degen_indices:
+        if len(degen_indices) == 1:
+            layer_str = f"layer {degen_indices[0]}"
+            verb = "has"
+        elif len(degen_indices) == 2:
+            layer_str = f"layers {' and '.join(map(str, degen_indices))}"
+            verb = "have"
+        elif len(degen_indices) >= num_layers:
+            layer_str = "ALL layers"
+            verb = "have"
+        else:
+            layer_str = (
+                "layers "
+                + ", ".join(map(str, degen_indices[:-1]))
+                + ", and "
+                + str(degen_indices[-1])
+            )
+            verb = "have"
 
-       logging.warning(
-           f"{layer_str} {verb} degenerate routing parameters "
-           "- your prompts may be too similar."
-       )
-       logging.warning("One or more experts will be underutilized in your model.")
+        logging.warning(
+            f"{layer_str} {verb} degenerate routing parameters "
+            "- your prompts may be too similar."
+        )
+        logging.warning("One or more experts will be underutilized in your model.")
+
+
 
 
 def is_bad_config(config: DeepseekMOEConfig, allow_all_same: bool = False) -> bool:
@@ -349,7 +351,7 @@ def build(
        for layer_idx in range(base_cfg.num_hidden_layers):
             for weight_info in Deepseek_INFO.layer_weights(index=layer_idx, config=base_cfg):
                 tensor_name = weight_info.name
-
+    
             if ".mlp." in tensor_name:
                 if tensor_name.endswith((".gate_proj.weight", ".up_proj.weight", ".down_proj.weight")):
                     # Save expert weights
@@ -362,10 +364,10 @@ def build(
                         if expert.noise_scale:
                             tensor += torch.randn_like(tensor) * expert.noise_scale
                         writer.save_tensor(
-                            expert_name, tensor.to(dtype=out_dtype), clone=True
+                            expert_name, tensor.to(dtype=out_dtype), clone=clone_tensors
                         )
-
-                    # Save shared expert weights
+    
+                    # Save shared expert weights (if any)
                     if config.n_shared_experts > 0:
                         for shared_expert_idx in range(config.n_shared_experts):
                             shared_expert_name = tensor_name.replace(
