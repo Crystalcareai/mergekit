@@ -335,7 +335,18 @@ def build(
 
             if ".mlp." in tensor_name:
                 for moe_index, expert in enumerate(config.experts):
-                    expert_name = tensor_name.replace(
+                    expert_model = ModelReference.parse(expert.source_model)
+                    expert_loader = LazyTensorLoader(
+                        expert_model.tensor_index(cache_dir=merge_options.transformers_cache),
+                        lazy_unpickle=merge_options.lazy_unpickle,
+                    )
+                    expert_arch_info = mergekit.architecture.get_architecture_info(expert_model.config(trust_remote_code=merge_options.trust_remote_code))
+                    expert_weight_info = expert_arch_info.layer_weights(index=layer_idx, config=expert_model.config(trust_remote_code=merge_options.trust_remote_code))
+                    expert_tensor_name = next((wi.name for wi in expert_weight_info if wi.name.endswith(tensor_name.split(".")[-1])), None)
+                    if expert_tensor_name is None:
+                        raise ValueError(f"Could not find matching weight for {tensor_name} in expert {expert.source_model}")
+
+                    expert_name = expert_tensor_name.replace(
                         ".mlp.gate_proj", f".block_sparse_moe.experts.{moe_index}.w1"
                     )
                     expert_name = expert_name.replace(
@@ -344,7 +355,7 @@ def build(
                     expert_name = expert_name.replace(
                         ".mlp.up_proj", f".block_sparse_moe.experts.{moe_index}.w3"
                     )
-                    tensor = base_loader.get_tensor(tensor_name)
+                    tensor = expert_loader.get_tensor(expert_tensor_name)
                     if expert.noise_scale:
                         tensor += torch.randn_like(tensor) * expert.noise_scale
                     writer.save_tensor(
