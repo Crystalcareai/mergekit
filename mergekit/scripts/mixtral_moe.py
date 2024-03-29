@@ -1,24 +1,10 @@
-# Copyright (C) 2024 Charles O. Goddard
-#
-# This software is free software: you can redistribute it and/or
-# modify it under the terms of the GNU Lesser General Public License as
-# published by the Free Software Foundation, either version 3 of the
-# License, or (at your option) any later version.
-#
-# This software is distributed in the hope that it will be useful, but
-# WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-# Lesser General Public License for more details.
-#
-# You should have received a copy of the GNU Lesser General Public License
-# along with this program. If not, see http://www.gnu.org/licenses/.
-
 import logging
 import os
 import sys
 from typing import Dict, List, Optional, Union
 
 import click
+import re
 import torch
 import tqdm
 import transformers
@@ -26,27 +12,21 @@ import yaml
 from pydantic import BaseModel
 from transformers import (
     AutoModelForCausalLM,
-    LlamaForCausalLM,
-    MistralConfig,
-    MistralForCausalLM,
-    MixtralConfig,
+    AutoConfig,
+    AutoTokenizer,
+    PreTrainedTokenizerBase,
 )
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-import mergekit.architecture
 from mergekit.common import ModelReference, dtype_from_name
 from mergekit.io import LazyTensorLoader, TensorWriter
 from mergekit.merge import MergeOptions
 from mergekit.options import add_merge_options
 
-# Create a Mixtral MoE from a set of equally-sized Mistral (or Llama) models.
-# Takes the path to a yml config and an output path.
-# Config schema is the two classes below.
-
 
 class Expert(BaseModel):
     source_model: str
-
+    tokenizer: Optional[str] = None
     positive_prompts: List[str]
     negative_prompts: Optional[List[str]] = None
     noise_scale: Optional[float] = None
@@ -57,18 +37,14 @@ class Expert(BaseModel):
 
 
 class MistralMOEConfig(BaseModel):
-    base_model: str
     experts: List[Expert]
-    gate_mode: str = "hidden"  # possible values: "hidden", "cheap_embed", "random"
-    # "hidden" uses hidden state vectors for the given prompts for each layer
-    # "cheap_embed" uses the average of token embeddings for the prompts, same for each layer
-    # "random" is random
+    gate_mode: str = "hidden"
     dtype: Optional[str] = None
     experts_per_token: int = 2
 
 
 def get_hidden_states(
-    model: Union[MistralForCausalLM, LlamaForCausalLM],
+    model: AutoModelForCausalLM,
     tokenized: transformers.BatchEncoding,
     average: bool = True,
 ) -> List[torch.Tensor]:
@@ -110,7 +86,7 @@ def get_cheap_embedding(
 
 
 def tokenize_prompts(
-    prompts: List[str], tokenizer: transformers.PreTrainedTokenizerBase
+    prompts: List[str], tokenizer: PreTrainedTokenizerBase
 ):
     return tokenizer(
         [tokenizer.bos_token + p for p in prompts],
@@ -122,7 +98,7 @@ def tokenize_prompts(
 
 def get_gate_params(
     model_ref: ModelReference,
-    tokenizer: transformers.PreTrainedTokenizerBase,
+    tokenizer: PreTrainedTokenizerBase,
     experts: List[Expert],
     mode: str = "hidden",
     load_in_4bit: bool = False,
@@ -253,6 +229,76 @@ def is_bad_config(config: MistralMOEConfig, allow_all_same: bool = False) -> boo
             return True
 
 
+def get_parametered_layers_list(model, num_hidden_layers):
+    """
+    Given a model and the number of hidden layers, this function returns two lists:
+    one containing the parameterized layers of the model, grouped by hidden layer,
+    and the other containing the remaining parameterized layers of the model.
+    """
+    layers = []
+    for name, module in model.named_parameters():
+        layers.append((name, module))
+    hidden_layers = [[] for _ in range(num_hidden_layers)]
+
+    other_layers = []
+
+    for layer in layers:
+        if re.search(r"layers\.\d+", layer[0]):
+            hidden_layers[int(layer[0].split("layers.")[1].split(".")[0])].append(layer)
+        else:
+            other_layers.append(layer)
+
+    return hidden_layers, other_layers
+
+
+def copy_weight(model, moe_model, expert_index=None):
+    """
+    Copy weights from model to moe_model for matching layers.
+    If expert_index is provided, copy weights to the specified expert in the MoE model.
+    """
+    model_hidden_layers, model_other_layers = get_parametered_layers_list(model, model.config.num_hidden_layers)
+    moe_hidden_layers, moe_other_layers = get_parametered_layers_list(moe_model, moe_model.config.num_hidden_layers)
+
+    model_other_layers = {layer[0]: layer[1] for layer in model_other_layers}
+    moe_other_layers = {layer[0]: layer[1] for layer in moe_other_layers}
+
+    if expert_index is None:
+        # Copy embeddings and other layers from the first expert
+        for other_layer in model_other_layers:
+            if other_layer in moe_other_layers:
+                moe_other_layers[other_layer].data = model_other_layers[other_layer].data
+            else:
+                logging.warning(
+                    f"Layer {other_layer} not found in MoE model. Skipping."
+                )
+    else:
+        # Copy expert model weights to the corresponding expert in the MoE model
+        num_model_layers = len(model_hidden_layers)
+        num_moe_layers = len(moe_hidden_layers)
+
+        if num_model_layers != num_moe_layers:
+            logging.warning(
+                f"Expert model {expert_index} has {num_model_layers} hidden layers, "
+                f"while the MoE model has {num_moe_layers} hidden layers. "
+                "Copying weights to matching layers."
+            )
+
+        num_layers = min(num_model_layers, num_moe_layers)
+
+        for i in range(num_layers):
+            model_layer = model_hidden_layers[i]
+            moe_layer = moe_hidden_layers[i]
+
+            for weight_name, weight in model_layer:
+                if "mlp" not in weight_name:
+                    continue
+                
+                moe_weight_name = weight_name.replace(".mlp.", f".block_sparse_moe.experts.{expert_index}.")
+                moe_weight = next((w for n, w in moe_layer if n == moe_weight_name), None)
+                if moe_weight is not None:
+                    moe_weight.data.copy_(weight.data)
+                else:
+                    print(f"Warning: Weight {moe_weight_name} not found in MoE layer.")
 def build(
     config: MistralMOEConfig,
     out_path: str,
@@ -272,15 +318,20 @@ def build(
         logging.error("Experts per token must be <= number of experts")
         sys.exit(1)
 
-    base_model = ModelReference.parse(config.base_model)
-    base_cfg = base_model.config(trust_remote_code=merge_options.trust_remote_code)
-    if not isinstance(base_cfg, MistralConfig):
-        base_cfg_mistral = MistralConfig(**base_cfg.to_dict())
-        base_cfg_mistral.sliding_window = None
-        base_cfg_mistral.max_position_embeddings = base_cfg.max_position_embeddings
-        base_cfg = base_cfg_mistral
+    expert_models = []
+    expert_tokenizers = []
+    expert_configs = []
 
-    out_cfg = MixtralConfig(**base_cfg.to_dict())
+    for expert in config.experts:
+        expert_model = AutoModelForCausalLM.from_pretrained(expert.source_model)
+        expert_tokenizer = AutoTokenizer.from_pretrained(expert.tokenizer or expert.source_model)
+        expert_config = expert_model.config
+
+        expert_models.append(expert_model)
+        expert_tokenizers.append(expert_tokenizer)
+        expert_configs.append(expert_config)
+
+    out_cfg = AutoConfig.from_pretrained(config.experts[0].source_model)
     out_cfg.architectures = ["MixtralForCausalLM"]
     out_cfg.num_local_experts = len(config.experts)
     out_cfg.num_experts_per_tok = config.experts_per_token
@@ -289,16 +340,13 @@ def build(
         out_cfg.torch_dtype = config.dtype
     out_cfg.save_pretrained(out_path)
 
+    out_model = AutoModelForCausalLM.from_config(out_cfg)
+
     if (out_cfg.num_local_experts & (out_cfg.num_local_experts - 1)) != 0:
         logging.warning(
             f"Your model has {out_cfg.num_local_experts} experts, which is "
             "not a power of two. The model will not be usable in llama.cpp."
         )
-
-    base_loader = LazyTensorLoader(
-        base_model.tensor_index(cache_dir=merge_options.transformers_cache),
-        lazy_unpickle=merge_options.lazy_unpickle,
-    )
 
     writer = TensorWriter(
         out_path=out_path,
@@ -308,73 +356,28 @@ def build(
 
     if config.dtype:
         out_dtype = dtype_from_name(config.dtype)
-    elif base_cfg.torch_dtype:
-        out_dtype = base_cfg.torch_dtype
+    elif expert_configs[0].torch_dtype:
+        out_dtype = expert_configs[0].torch_dtype
         if isinstance(out_dtype, str):
             out_dtype = dtype_from_name(out_dtype)
     else:
         out_dtype = None
 
     logging.info("Copying parameters...")
-    base_arch_info = mergekit.architecture.get_architecture_info(base_cfg)
-    for weight_info in base_arch_info.pre_weights(base_cfg) + base_arch_info.post_weights(base_cfg):
-        tensor_name = weight_info.name
-        tensor = base_loader.get_tensor(tensor_name)
-        if not out_dtype:
-            out_dtype = tensor.dtype
-        writer.save_tensor(
-            tensor_name, tensor.to(dtype=out_dtype), clone=merge_options.clone_tensors
-        )
 
-    for layer_idx in range(base_cfg.num_hidden_layers):
-        for weight_info in base_arch_info.layer_weights(index=layer_idx, config=base_cfg):
-            tensor_name = weight_info.name
+    # Copy embeddings and other layers from the first expert
+    copy_weight(expert_models[0], out_model)
 
-            if "block_sparse_moe" in tensor_name:
-                continue
+    for i, expert_model in enumerate(expert_models):
+        copy_weight(expert_model, out_model, expert_index=i)
 
-            if ".mlp." in tensor_name:
-                for moe_index, expert in enumerate(config.experts):
-                    expert_model = ModelReference.parse(expert.source_model)
-                    expert_loader = LazyTensorLoader(
-                        expert_model.tensor_index(cache_dir=merge_options.transformers_cache),
-                        lazy_unpickle=merge_options.lazy_unpickle,
-                    )
-                    expert_arch_info = mergekit.architecture.get_architecture_info(expert_model.config(trust_remote_code=merge_options.trust_remote_code))
-                    expert_weight_info = expert_arch_info.layer_weights(index=layer_idx, config=expert_model.config(trust_remote_code=merge_options.trust_remote_code))
-                    expert_tensor_name = next((wi.name for wi in expert_weight_info if wi.name.endswith(tensor_name.split(".")[-1])), None)
-                    if expert_tensor_name is None:
-                        raise ValueError(f"Could not find matching weight for {tensor_name} in expert {expert.source_model}")
-
-                    expert_name = expert_tensor_name.replace(
-                        ".mlp.gate_proj", f".block_sparse_moe.experts.{moe_index}.w1"
-                    )
-                    expert_name = expert_name.replace(
-                        ".mlp.down_proj", f".block_sparse_moe.experts.{moe_index}.w2"
-                    )
-                    expert_name = expert_name.replace(
-                        ".mlp.up_proj", f".block_sparse_moe.experts.{moe_index}.w3"
-                    )
-                    tensor = expert_loader.get_tensor(expert_tensor_name)
-                    if expert.noise_scale:
-                        tensor += torch.randn_like(tensor) * expert.noise_scale
-                    writer.save_tensor(
-                        expert_name, tensor.to(dtype=out_dtype), clone=True
-                    )
-            else:
-                writer.save_tensor(
-                    tensor_name, base_loader.get_tensor(tensor_name).to(dtype=out_dtype)
-                )
-
-    tokenizer = transformers.AutoTokenizer.from_pretrained(
-        base_model.model.path, revision=base_model.model.revision
-    )
+    tokenizer = expert_tokenizers[0]
     tokenizer.padding_side = "left"
     tokenizer.pad_token_id = tokenizer.bos_token_id
 
     logging.info("Getting gate parameters...")
     gate_vecs = get_gate_params(
-        base_model,
+        ModelReference.parse(config.experts[0].source_model),
         tokenizer,
         config.experts,
         mode=config.gate_mode,
@@ -383,12 +386,10 @@ def build(
         lazy_unpickle=merge_options.lazy_unpickle,
         trust_remote_code=merge_options.trust_remote_code,
         device=device,
-    )
-    # gate_vecs: (num_layers, num_experts, hidden_size)
-
+)
     warn_degenerate_gates(gate_vecs)
 
-    for layer_idx in range(base_cfg.num_hidden_layers):
+    for layer_idx in range(out_cfg.num_hidden_layers):
         writer.save_tensor(
             f"model.layers.{layer_idx}.block_sparse_moe.gate.weight",
             gate_vecs[layer_idx, :, :].contiguous().to(dtype=out_dtype),
@@ -400,8 +401,6 @@ def build(
         tokenizer.save_pretrained(out_path, safe_serialization=True)
 
     logging.info("Done.")
-
-
 
 @click.command("mergekit-moe")
 @click.argument("config_path", type=click.Path(exists=True, dir_okay=False))
@@ -475,7 +474,6 @@ def main(
             os.path.join(out_path, "mergekit_moe_config.yml"), "w", encoding="utf-8"
         ) as fp:
             fp.write(config_source)
-
 
 if __name__ == "__main__":
     main()
